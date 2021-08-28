@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use cargo_lock::Lockfile;
+use cargo_metadata::Artifact;
+use futures::future::join_all;
 use nipper::Document;
 use tokio::fs;
 use tokio::process::Command;
@@ -20,6 +22,7 @@ use super::{ATTR_HREF, SNIPPETS_DIR};
 use crate::common::{self, copy_dir_recursive, path_exists};
 use crate::config::{CargoMetadata, ConfigOptsTools, RtcBuild};
 use crate::tools::{self, Application};
+
 
 /// A Rust application pipeline.
 pub struct RustApp {
@@ -44,7 +47,23 @@ pub struct RustApp {
     /// An optional optimization setting that enables wasm-opt. Can be nothing, `0` (default), `1`,
     /// `2`, `3`, `4`, `s or `z`. Using `0` disables wasm-opt completely.
     wasm_opt: WasmOptLevel,
+    /// Worker names
+    worker_names: Vec<String>,
 }
+
+/// Cargo build output
+#[derive (Debug)]
+struct CargoBuildOutput {
+    /// path to wasm file
+    wasm: PathBuf,
+    /// hashed name
+    hashed_name: String,
+    /// indicates if
+    is_worker: bool,
+    worker_name: Option<String>,
+}
+
+
 
 impl RustApp {
     pub const TYPE_RUST_APP: &'static str = "rust";
@@ -79,6 +98,12 @@ impl RustApp {
         let manifest = CargoMetadata::new(&manifest_href).await?;
         let id = Some(id);
 
+        let worker_names = match attrs.get("data-workers") {
+            None => Vec::new(),
+            Some(wn) => wn.split(",").map(|s| s.trim().to_string()).collect(),
+        };
+
+
         Ok(Self {
             id,
             cfg,
@@ -89,6 +114,7 @@ impl RustApp {
             keep_debug,
             no_demangle,
             wasm_opt,
+            worker_names,
         })
     }
 
@@ -105,6 +131,7 @@ impl RustApp {
             keep_debug: false,
             no_demangle: false,
             wasm_opt: WasmOptLevel::Off,
+            worker_names: Vec::new(),
         })
     }
 
@@ -116,14 +143,33 @@ impl RustApp {
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn build(mut self) -> Result<TrunkLinkPipelineOutput> {
-        let (wasm, hashed_name) = self.cargo_build().await?;
-        let output = self.wasm_bindgen_build(wasm.as_ref(), &hashed_name).await?;
-        self.wasm_opt_build(&output.wasm_output).await?;
+        let cargo_build_output = self.cargo_build().await?;
+        tracing::info!("cargo_output = {:?}", cargo_build_output);
+        let mut wasm_files = Vec::<RustAppOutputWasm>::new();
+        for i in 0..cargo_build_output.len() {
+            let cbo = &cargo_build_output[i];
+            let (js_output, wasm_output) = self.wasm_bindgen_build(
+                cbo.wasm.as_ref(), &cbo.hashed_name, cbo.is_worker,
+            ).await?;
+            self.wasm_opt_build(&wasm_output).await?;
+            wasm_files.push(RustAppOutputWasm {
+                js_output,
+                wasm_output,
+                is_worker: cbo.is_worker,
+                worker_name: cbo.worker_name.clone(),
+            });
+        }
+        let output = RustAppOutput {
+            id: self.id,
+            cfg: self.cfg.clone(),
+            wasm_files,
+        };
+
         Ok(TrunkLinkPipelineOutput::RustApp(output))
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn cargo_build(&mut self) -> Result<(PathBuf, String)> {
+    async fn cargo_build(&mut self) -> Result<Vec<CargoBuildOutput>> {
         tracing::info!("building {}", &self.manifest.package.name);
 
         // Spawn the cargo build process.
@@ -136,15 +182,20 @@ impl RustApp {
         if self.cfg.release {
             args.push("--release");
         }
-        if let Some(bin) = &self.bin {
-            args.push("--bin");
-            args.push(bin);
+
+        if self.worker_names.len() == 0 {
+            if let Some(bin) = &self.bin {
+                args.push("--bin");
+                args.push(bin);
+            }
         }
+
         if let Some(cargo_features) = &self.cargo_features {
             args.push("--features");
             args.push(cargo_features);
         }
 
+        tracing::info!("cargo {}", args.join(" "));
         let build_res = common::run_command("cargo", Path::new("cargo"), &args)
             .await
             .context("error during cargo build execution");
@@ -178,33 +229,84 @@ impl RustApp {
 
         // Stream over cargo messages to find the artifacts we are interested in.
         let reader = std::io::BufReader::new(artifacts_out.stdout.as_slice());
-        let artifact = cargo_metadata::Message::parse_stream(reader)
+        let wasm_filenames: Vec<PathBuf> = cargo_metadata::Message::parse_stream(reader)
             .filter_map(|msg| if let Ok(msg) = msg { Some(msg) } else { None })
-            .fold(Ok(None), |acc, msg| match msg {
-                cargo_metadata::Message::CompilerArtifact(art) if art.package_id == self.manifest.package.id => Ok(Some(art)),
-                cargo_metadata::Message::BuildFinished(finished) if !finished.success => Err(anyhow!("error while fetching cargo artifact info")),
-                _ => acc,
-            })?
-            .context("cargo artifacts not found for target crate")?;
-
-        // Get a handle to the WASM output file.
-        let wasm = artifact
-            .filenames
+            .filter_map(|msg| match msg {
+                cargo_metadata::Message::CompilerArtifact(art) if art.package_id == self.manifest.package.id => Some(Ok(art)),
+                cargo_metadata::Message::BuildFinished(finished) if !finished.success => Some(Err(anyhow!("error while fetching cargo artifact info"))),
+                _ => None,
+            })
+            .collect::<Result<Vec<Artifact>, _>>()?
             .into_iter()
-            .find(|path| path.extension().map(|ext| ext == "wasm").unwrap_or(false))
-            .context("could not find WASM output after cargo build")?;
+            .filter_map(|art| {
+                art.filenames.into_iter().find(|path|{
+                    path.extension().map(|ext| ext == "wasm").unwrap_or(false)
+                })
+            }).collect();
 
-        // Hash the built wasm app, then use that as the out-name param.
+        if wasm_filenames.len() == 0 {
+            bail!("could not find WASM output after cargo build");
+        }
+
+        let mut build_output: Vec<CargoBuildOutput> = match &self.bin {
+            None => {
+                if wasm_filenames.len() != 1 {
+                    bail!("found multiple WASM output files, consider using <link> with a data-bin attribute in your index.html")
+                }
+                wasm_filenames.into_iter().map(|wasm| {
+                    CargoBuildOutput {
+                        wasm,
+                        hashed_name: "".to_string(),
+                        is_worker: false,
+                        worker_name: None,
+                    }
+                }).collect()
+            }
+            Some(bin) => {
+                let output = wasm_filenames.into_iter().filter_map(|wasm| {
+                    let wasm_file_stem = wasm.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                    tracing::info!("{}, {}, {}", wasm_file_stem, bin, wasm_file_stem.eq(bin));
+                    if wasm_file_stem.eq(bin) {
+                        return Some(CargoBuildOutput {
+                            wasm,
+                            hashed_name: "".to_string(),
+                            is_worker: false,
+                            worker_name: None,
+                        });
+                    }
+
+                    if self.worker_names.iter().any(|worker_name| wasm_file_stem.eq(worker_name)) {
+                        return Some(CargoBuildOutput {
+                            wasm,
+                            hashed_name: "".to_string(),
+                            is_worker: true,
+                            worker_name: Some(wasm_file_stem.clone()),
+                        });
+                    }
+                    None
+                }).collect();
+                output
+                // TODO check if everything has a output file
+            }
+        };
+
         tracing::info!("processing WASM");
-        let wasm_bytes = fs::read(&wasm)
+        let hashed_name_futures: Vec<_> = build_output.iter().map(|o| {
+            get_wasm_file_hashed_name(&o.wasm, &o.worker_name)
+        }).collect();
+
+        let hashed_names: Vec<String> = join_all(hashed_name_futures)
             .await
-            .context("error reading wasm file for hash generation")?;
-        let hashed_name = format!("index-{:x}", seahash::hash(&wasm_bytes));
-        Ok((wasm, hashed_name))
+            .into_iter()
+            .collect::<Result<Vec<String>, _>>()?;
+
+        hashed_names.into_iter().enumerate().for_each(|(i, n)| build_output[i].hashed_name = n);
+
+        Ok(build_output)
     }
 
     #[tracing::instrument(level = "trace", skip(self, wasm, hashed_name))]
-    async fn wasm_bindgen_build(&self, wasm: &Path, hashed_name: &str) -> Result<RustAppOutput> {
+    async fn wasm_bindgen_build(&self, wasm: &Path, hashed_name: &str, is_worker: bool) -> Result<(String, String)> {
         let version = find_wasm_bindgen_version(&self.cfg.tools, &self.manifest);
         let wasm_bindgen = tools::get(Application::WasmBindgen, version.as_deref()).await?;
 
@@ -224,8 +326,9 @@ impl RustApp {
         // Build up args for calling wasm-bindgen.
         let arg_out_path = format!("--out-dir={}", bindgen_out.display());
         let arg_out_name = format!("--out-name={}", &hashed_name);
+        let arg_target = if is_worker { "--target=no-modules" } else { "--target=web" };
         let target_wasm = wasm.to_string_lossy().to_string();
-        let mut args = vec!["--target=web", &arg_out_path, &arg_out_name, "--no-typescript", &target_wasm];
+        let mut args = vec![arg_target, &arg_out_path, &arg_out_name, "--no-typescript", &target_wasm];
         if self.keep_debug {
             args.push("--keep-debug");
         }
@@ -235,6 +338,7 @@ impl RustApp {
 
         // Invoke wasm-bindgen.
         tracing::info!("calling wasm-bindgen");
+        tracing::info!("{} {}", wasm_bindgen.display(), args.join(" "));
         common::run_command(wasm_bindgen_name, &wasm_bindgen, &args)
             .await
             .map_err(|err| check_target_not_found_err(err, wasm_bindgen_name))?;
@@ -262,12 +366,7 @@ impl RustApp {
                 .context("error copying snippets dir to stage dir")?;
         }
 
-        Ok(RustAppOutput {
-            id: self.id,
-            cfg: self.cfg.clone(),
-            js_output: hashed_js_name,
-            wasm_output: hashed_wasm_name,
-        })
+        Ok((hashed_js_name, hashed_wasm_name))
     }
 
     #[tracing::instrument(level = "trace", skip(self, hashed_name))]
@@ -356,42 +455,62 @@ fn find_wasm_bindgen_version<'a>(cfg: &'a ConfigOptsTools, manifest: &CargoMetad
         .or_else(find_manifest)
 }
 
+/// The worker specific output of a cargo build pipeline
+pub struct RustAppOutputWasm {
+    /// The filename of the generated JS loader file written to the dist dir.
+    pub js_output: String,
+    /// The filename of the generated WASM file written to the dist dir.
+    pub wasm_output: String,
+    /// Indicates if this is a worker.
+    pub is_worker: bool,
+    /// The name of the worker if this is a worker.
+    pub worker_name: Option<String>,
+}
+
 /// The output of a cargo build pipeline.
 pub struct RustAppOutput {
     /// The runtime build config.
     pub cfg: Arc<RtcBuild>,
     /// The ID of this pipeline.
     pub id: Option<usize>,
-    /// The filename of the generated JS loader file written to the dist dir.
-    pub js_output: String,
-    /// The filename of the generated WASM file written to the dist dir.
-    pub wasm_output: String,
+    /// The wasm files output by this pipeline.
+    pub wasm_files: Vec<RustAppOutputWasm>,
 }
 
 impl RustAppOutput {
     pub async fn finalize(self, dom: &mut Document) -> Result<()> {
-        let (base, js, wasm, head, body) = (&self.cfg.public_url, &self.js_output, &self.wasm_output, "html head", "html body");
+        let (base, head, body) = (&self.cfg.public_url, "html head", "html body");
 
-        let preload = format!(
-            r#"
-<link rel="preload" href="{base}{wasm}" as="fetch" type="application/wasm" crossorigin>
-<link rel="modulepreload" href="{base}{js}">"#,
-            base = base,
-            js = js,
-            wasm = wasm,
-        );
-        dom.select(head).append_html(preload);
+        self.wasm_files.iter().for_each(|f| {
+            let wasm = &f.wasm_output;
+            let js = &f.js_output;
+            let preload = format!(
+                r#"
+    <link rel="preload" href="{base}{wasm}" as="fetch" type="application/wasm" crossorigin>
+    <link rel="modulepreload" href="{base}{js}">"#,
+                base = base,
+                js = js,
+                wasm = wasm,
+            );
+            dom.select(head).append_html(preload);
+        });
 
-        let script = format!(
-            r#"<script type="module">import init from '{base}{js}';init('{base}{wasm}');</script>"#,
-            base = base,
-            js = js,
-            wasm = wasm,
-        );
-        match self.id {
-            Some(id) => dom.select(&super::trunk_id_selector(id)).replace_with_html(script),
-            None => dom.select(body).append_html(script),
-        }
+        self.wasm_files.iter().for_each(|f| {
+            if !f.is_worker {
+                let wasm = &f.wasm_output;
+                let js = &f.js_output;
+                let script = format!(
+                    r#"<script type="module">import init from '{base}{js}';init('{base}{wasm}');</script>"#,
+                    base = base,
+                    js = js,
+                    wasm = wasm,
+                );
+                match self.id {
+                    Some(id) => dom.select(&super::trunk_id_selector(id)).replace_with_html(script),
+                    None => dom.select(body).append_html(script),
+                }
+            }
+        });
         Ok(())
     }
 }
@@ -467,5 +586,18 @@ fn check_target_not_found_err(err: anyhow::Error, target: &str) -> anyhow::Error
     match io_err.kind() {
         std::io::ErrorKind::NotFound => err.context(format!("{} not found", target)),
         _ => err,
+    }
+}
+
+async fn get_wasm_file_hashed_name(wasm: &PathBuf, worker_name: &Option<String>) -> Result<String> {
+    match worker_name {
+        None => {
+            let wasm_bytes = fs::read(&wasm)
+                .await
+                .context("error reading wasm file for hash generation")?;
+            let hashed_name = format!("index-{:x}", seahash::hash(&wasm_bytes));
+            Ok(hashed_name)
+        }
+        Some(wn) => Ok(wn.clone())
     }
 }
